@@ -5,9 +5,11 @@ import ru.vk.itmo.Dao;
 import ru.vk.itmo.Entry;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.channels.InterruptedByTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
@@ -15,13 +17,20 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>> {
+    private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
+
     private final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
     private final NavigableMap<MemorySegment, Entry<MemorySegment>> storage = new ConcurrentSkipListMap<>(comparator);
     private final Arena arena;
     private final Compaction diskStorage;
     private final Path path;
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     public MemorySegmentDao(Config config) throws IOException {
         this.path = config.basePath().resolve("data");
@@ -97,14 +106,33 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
 
     @Override
     public void flush() throws IOException {
-        if (!storage.isEmpty()) {
-            DiskStorage.save(path, storage.values());
-        }
+        bgExecutor.execute(() -> {
+            synchronized (this) {
+                if (!storage.isEmpty()) {
+                    try {
+                        DiskStorage.save(path, storage.values());
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                }
+            }
+
+        });
+
     }
 
     @Override
     public void compact() throws IOException {
-        diskStorage.compact(path, storage);
+        bgExecutor.execute(() -> {
+            synchronized (this) {
+                try {
+                    diskStorage.compact(path, storage);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+
+        });
     }
 
     @Override
@@ -114,7 +142,14 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
         }
 
         flush();
-
+        bgExecutor.shutdown();
+        try {
+            if (!bgExecutor.awaitTermination(7, TimeUnit.MINUTES)) {
+                throw new InterruptedByTimeoutException();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         arena.close();
     }
 }
