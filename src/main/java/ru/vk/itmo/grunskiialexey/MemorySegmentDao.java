@@ -5,32 +5,39 @@ import ru.vk.itmo.Dao;
 import ru.vk.itmo.Entry;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.channels.InterruptedByTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
+import java.util.List;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import static ru.vk.itmo.grunskiialexey.MemorySegmentDao.StorageState.comparator;
 
 public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>> {
     private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
 
-    private final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
-    private final NavigableMap<MemorySegment, Entry<MemorySegment>> storage = new ConcurrentSkipListMap<>(comparator);
     private final Arena arena;
     private final Compaction diskStorage;
     private final Path path;
+    private final AtomicReference<StorageState> state = new AtomicReference<>(new StorageState());
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
 
     public MemorySegmentDao(Config config) throws IOException {
         this.path = config.basePath().resolve("data");
@@ -38,7 +45,8 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
 
         arena = Arena.ofShared();
 
-        this.diskStorage = new Compaction(DiskStorage.loadOrRecover(path, arena));
+        List<MemorySegment> segments = DiskStorage.loadOrRecover(path, arena);
+
     }
 
     static int compare(MemorySegment memorySegment1, MemorySegment memorySegment2) {
@@ -61,10 +69,20 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
 
     @Override
     public Iterator<Entry<MemorySegment>> get(MemorySegment from, MemorySegment to) {
-        return diskStorage.range(getInMemory(from, to), from, to);
+        StorageState state = this.state.get();
+
+        return Compaction.range(
+                getInMemory(state.readStorage, from, to),
+                getInMemory(state.writeStorage, from, to),
+                state.diskSegmentList,
+                from,
+                to
+        );
     }
 
-    private Iterator<Entry<MemorySegment>> getInMemory(MemorySegment from, MemorySegment to) {
+    private Iterator<Entry<MemorySegment>> getInMemory(
+            NavigableMap<MemorySegment, Entry<MemorySegment>> storage,
+            MemorySegment from, MemorySegment to) {
         if (from == null && to == null) {
             return storage.values().iterator();
         }
@@ -79,46 +97,74 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
 
     @Override
     public void upsert(Entry<MemorySegment> entry) {
-        storage.put(entry.key(), entry);
+        upsertLock.readLock().lock();
+        try {
+            state.get().writeStorage.put(entry.key(), entry);
+        } finally {
+            upsertLock.readLock().unlock();
+        }
     }
 
     @Override
     public Entry<MemorySegment> get(MemorySegment key) {
-        Entry<MemorySegment> entry = storage.get(key);
-        if (entry != null) {
-            if (entry.value() == null) {
+        synchronized (this) {
+            Entry<MemorySegment> entry = writeStorage.get(key);
+            if (entry != null) {
+                if (entry.value() == null) {
+                    return null;
+                }
+                return entry;
+            }
+
+            Iterator<Entry<MemorySegment>> iterator = diskStorage.range(Collections.emptyIterator(), key, null);
+
+            if (!iterator.hasNext()) {
                 return null;
             }
-            return entry;
-        }
-
-        Iterator<Entry<MemorySegment>> iterator = diskStorage.range(Collections.emptyIterator(), key, null);
-
-        if (!iterator.hasNext()) {
+            Entry<MemorySegment> next = iterator.next();
+            if (compare(next.key(), key) == 0) {
+                return next;
+            }
             return null;
         }
-        Entry<MemorySegment> next = iterator.next();
-        if (compare(next.key(), key) == 0) {
-            return next;
-        }
-        return null;
     }
 
     @Override
     public void flush() {
         bgExecutor.execute(() -> {
-            synchronized (this) {
-                if (!storage.isEmpty()) {
-                    try {
-                        DiskStorage.save(path, storage.values());
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
-                }
+            Collection<Entry<MemorySegment>> entries;
+            ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage = state.get().writeStorage;
+            if (writeStorage.isEmpty()) {
+                return;
             }
 
-        });
+            StorageState nextState = new StorageState(writeStorage, new ConcurrentSkipListMap<>(comparator));
 
+            upsertLock.writeLock().lock();
+            try {
+                state.set(nextState);
+            } finally {
+                upsertLock.writeLock().unlock();
+            }
+
+            MemorySegment newPage;
+            entries = writeStorage.values();
+            try {
+                newPage = DiskStorage.save(path, entries);
+            } catch (IOException e) {
+                // termination sequence
+                throw new UncheckedIOException(e);
+            }
+            writeStorage = new ConcurrentSkipListMap<>(comparator);
+
+            nextState = new StorageState(new ConcurrentSkipListMap<>(StorageState.comparator), nextState.writeStorage);
+            upsertLock.writeLock().lock();
+            try {
+                state.set(nextState);
+            } finally {
+                upsertLock.writeLock().unlock();
+            }
+        });
     }
 
     @Override
@@ -126,30 +172,55 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
         bgExecutor.execute(() -> {
             synchronized (this) {
                 try {
-                    diskStorage.compact(path, storage);
+                    StorageState state = this.state.get();
+                    MemorySegment newPage = Compaction.compact(path, () -> Compaction.range(
+                            Collections.emptyIterator(),
+                            Collections.emptyIterator(),
+                            state.diskSegmentList,
+                            null,
+                            null
+                    ));
+                    this.state.set(
+                            new StorageState(state.readStorage,
+                                    state.writeStorage,
+                                    Collections.singletonList(newPage)
+                            ));
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
             }
-
         });
     }
 
     @Override
     public void close() throws IOException {
-        if (!arena.scope().isAlive()) {
+        if (closed.getAndSet(true)) {
+            waitForClose();
             return;
         }
 
         flush();
+        bgExecutor.execute(arena::close);
         bgExecutor.shutdown();
+        waitForClose();
+    }
+
+    private void waitForClose() throws InterruptedIOException {
         try {
-            if (!bgExecutor.awaitTermination(7, TimeUnit.MINUTES)) {
-                throw new InterruptedByTimeoutException();
+            if (!bgExecutor.awaitTermination(11, TimeUnit.MINUTES)) {
+                throw new InterruptedException("Timeout");
             }
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            InterruptedIOException exception = new InterruptedIOException("Interrupted or timed out");
+            exception.initCause(e);
+            throw exception;
         }
-        arena.close();
+    }
+
+    private static class StorageState {
+        private static final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
+        private final NavigableMap<MemorySegment, Entry<MemorySegment>> readStorage;
+        private final NavigableMap<MemorySegment, Entry<MemorySegment>> writeStorage;
+        private final List<MemorySegment> diskSegmentList;
     }
 }

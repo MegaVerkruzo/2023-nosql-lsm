@@ -25,21 +25,19 @@ import static ru.vk.itmo.grunskiialexey.DiskStorage.NAME_INDEX_FILE;
 import static ru.vk.itmo.grunskiialexey.DiskStorage.NAME_TMP_INDEX_FILE;
 
 public class Compaction {
-    private final List<MemorySegment> segmentList;
-
-    public Compaction(List<MemorySegment> segmentList) {
-        this.segmentList = segmentList;
-    }
-
-    public Iterator<Entry<MemorySegment>> range(
+    public static Iterator<Entry<MemorySegment>> range(
             Iterator<Entry<MemorySegment>> firstIterator,
-            MemorySegment from, MemorySegment to
+            Iterator<Entry<MemorySegment>> secondIterator,
+            List<MemorySegment> segmentList,
+            MemorySegment from,
+            MemorySegment to
     ) {
-        List<Iterator<Entry<MemorySegment>>> iterators = new ArrayList<>(segmentList.size() + 1);
+        List<Iterator<Entry<MemorySegment>>> iterators = new ArrayList<>(segmentList.size() + 2);
         for (MemorySegment memorySegment : segmentList) {
             iterators.add(iterator(memorySegment, from, to));
         }
         iterators.add(firstIterator);
+        iterators.add(secondIterator);
 
         return new MergeIterator<>(
                 iterators,
@@ -48,7 +46,7 @@ public class Compaction {
         );
     }
 
-    public void compact(
+    public static void compact(
             Path storagePath,
             NavigableMap<MemorySegment, Entry<MemorySegment>> iterable
     ) throws IOException {
@@ -137,7 +135,7 @@ public class Compaction {
         }
     }
 
-    private Iterator<Entry<MemorySegment>> iterator(MemorySegment page, MemorySegment from, MemorySegment to) {
+    private static Iterator<Entry<MemorySegment>> iterator(MemorySegment page, MemorySegment from, MemorySegment to) {
         long recordIndexFrom = from == null ? 0 : DiskStorage.normalize(DiskStorage.indexOf(page, from));
         long recordIndexTo = to == null
                 ? DiskStorage.recordsCount(page)

@@ -23,7 +23,7 @@ public final class DiskStorage {
     private DiskStorage() {
     }
 
-    public static void save(Path storagePath, Iterable<Entry<MemorySegment>> iterable)
+    public static MemorySegment save(Arena arena, Path storagePath, Iterable<Entry<MemorySegment>> iterable)
             throws IOException {
         final Path indexTmp = storagePath.resolve(NAME_TMP_INDEX_FILE);
         final Path indexFile = storagePath.resolve(NAME_INDEX_FILE);
@@ -48,16 +48,13 @@ public final class DiskStorage {
         }
         long indexSize = count * 2 * Long.BYTES;
 
-        try (
-                FileChannel fileChannel = FileChannel.open(
-                        storagePath.resolve(newFileName),
-                        StandardOpenOption.WRITE, StandardOpenOption.READ,
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING
-                );
-                Arena writeArena = Arena.ofConfined()
-        ) {
+        try (FileChannel fileChannel = FileChannel.open(
+                storagePath.resolve(newFileName),
+                StandardOpenOption.WRITE, StandardOpenOption.READ,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING
+        )) {
             MemorySegment fileSegment = fileChannel.map(
-                    FileChannel.MapMode.READ_WRITE, 0, indexSize + dataSize, writeArena
+                    FileChannel.MapMode.READ_WRITE, 0, indexSize + dataSize, arena
             );
 
             // index:
