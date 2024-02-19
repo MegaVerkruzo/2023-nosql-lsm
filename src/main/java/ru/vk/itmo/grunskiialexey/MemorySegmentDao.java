@@ -105,7 +105,7 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     }
 
     @Override
-    public void flush() throws IOException {
+    public void flush() {
         bgExecutor.execute(() -> {
             synchronized (this) {
                 if (!storage.isEmpty()) {
@@ -122,7 +122,7 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     }
 
     @Override
-    public void compact() throws IOException {
+    public void compact() {
         bgExecutor.execute(() -> {
             synchronized (this) {
                 try {
