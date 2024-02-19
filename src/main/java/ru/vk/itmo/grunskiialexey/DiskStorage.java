@@ -185,6 +185,9 @@ public final class DiskStorage {
     }
 
     static long recordsCount(MemorySegment segment) {
+        if (segment.byteSize() == 0L) {
+            return 0L;
+        }
         long indexSize = indexSize(segment);
         return indexSize / Long.BYTES / 2;
     }
