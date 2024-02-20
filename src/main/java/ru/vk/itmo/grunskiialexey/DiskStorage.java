@@ -48,12 +48,13 @@ public final class DiskStorage {
         }
         long indexSize = count * 2 * Long.BYTES;
 
+        MemorySegment fileSegment;
         try (FileChannel fileChannel = FileChannel.open(
                 storagePath.resolve(newFileName),
                 StandardOpenOption.WRITE, StandardOpenOption.READ,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING
         )) {
-            MemorySegment fileSegment = fileChannel.map(
+            fileSegment = fileChannel.map(
                     FileChannel.MapMode.READ_WRITE, 0, indexSize + dataSize, arena
             );
 
@@ -105,6 +106,7 @@ public final class DiskStorage {
         );
 
         Files.delete(indexTmp);
+        return fileSegment;
     }
 
     public static String getNewFileName(List<String> existedFiles) {

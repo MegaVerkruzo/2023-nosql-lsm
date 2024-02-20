@@ -12,12 +12,12 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
-import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -27,15 +27,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import static ru.vk.itmo.grunskiialexey.MemorySegmentDao.StorageState.comparator;
 
 public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>> {
     private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
 
+    private static final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
     private final Arena arena;
-    private final Compaction diskStorage;
     private final Path path;
-    private final AtomicReference<StorageState> state = new AtomicReference<>(new StorageState());
+    private final AtomicReference<StorageState> state;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
 
@@ -44,9 +43,8 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
         Files.createDirectories(path);
 
         arena = Arena.ofShared();
-
         List<MemorySegment> segments = DiskStorage.loadOrRecover(path, arena);
-
+        state = new AtomicReference<>(StorageState.initial(segments));
     }
 
     static int compare(MemorySegment memorySegment1, MemorySegment memorySegment2) {
@@ -81,7 +79,7 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     }
 
     private Iterator<Entry<MemorySegment>> getInMemory(
-            NavigableMap<MemorySegment, Entry<MemorySegment>> storage,
+            ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> storage,
             MemorySegment from, MemorySegment to) {
         if (from == null && to == null) {
             return storage.values().iterator();
@@ -108,7 +106,8 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     @Override
     public Entry<MemorySegment> get(MemorySegment key) {
         synchronized (this) {
-            Entry<MemorySegment> entry = writeStorage.get(key);
+            StorageState state = this.state.get();
+            Entry<MemorySegment> entry = state.writeStorage.get(key);
             if (entry != null) {
                 if (entry.value() == null) {
                     return null;
@@ -116,7 +115,12 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
                 return entry;
             }
 
-            Iterator<Entry<MemorySegment>> iterator = diskStorage.range(Collections.emptyIterator(), key, null);
+            Iterator<Entry<MemorySegment>> iterator = Compaction.range(
+                    getInMemory(state.readStorage, key, null),
+                    getInMemory(state.writeStorage, key, null),
+                    state.diskSegmentList,
+                    key,
+                    null);
 
             if (!iterator.hasNext()) {
                 return null;
@@ -133,12 +137,13 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     public void flush() {
         bgExecutor.execute(() -> {
             Collection<Entry<MemorySegment>> entries;
-            ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage = state.get().writeStorage;
+            StorageState prevState = state.get();
+            ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage = prevState.writeStorage;
             if (writeStorage.isEmpty()) {
                 return;
             }
 
-            StorageState nextState = new StorageState(writeStorage, new ConcurrentSkipListMap<>(comparator));
+            StorageState nextState = prevState.beforeFlush();
 
             upsertLock.writeLock().lock();
             try {
@@ -150,14 +155,13 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
             MemorySegment newPage;
             entries = writeStorage.values();
             try {
-                newPage = DiskStorage.save(path, entries);
+                newPage = DiskStorage.save(arena, path, entries);
             } catch (IOException e) {
                 // termination sequence
                 throw new UncheckedIOException(e);
             }
-            writeStorage = new ConcurrentSkipListMap<>(comparator);
 
-            nextState = new StorageState(new ConcurrentSkipListMap<>(StorageState.comparator), nextState.writeStorage);
+            nextState = nextState.afterFlush(newPage);
             upsertLock.writeLock().lock();
             try {
                 state.set(nextState);
@@ -173,18 +177,14 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
             synchronized (this) {
                 try {
                     StorageState state = this.state.get();
-                    MemorySegment newPage = Compaction.compact(path, () -> Compaction.range(
+                    MemorySegment newPage = Compaction.compact(arena, path, () -> Compaction.range(
                             Collections.emptyIterator(),
                             Collections.emptyIterator(),
                             state.diskSegmentList,
                             null,
                             null
                     ));
-                    this.state.set(
-                            new StorageState(state.readStorage,
-                                    state.writeStorage,
-                                    Collections.singletonList(newPage)
-                            ));
+                    this.state.set(state.compact(newPage));
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
@@ -218,9 +218,45 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     }
 
     private static class StorageState {
-        private static final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
-        private final NavigableMap<MemorySegment, Entry<MemorySegment>> readStorage;
-        private final NavigableMap<MemorySegment, Entry<MemorySegment>> writeStorage;
+        private final ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> readStorage;
+        private final ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage;
         private final List<MemorySegment> diskSegmentList;
+
+        private StorageState(
+                ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> readStorage,
+                ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage,
+                List<MemorySegment> diskSegmentList
+        ) {
+            this.readStorage = readStorage;
+            this.writeStorage = writeStorage;
+            this.diskSegmentList = diskSegmentList;
+        }
+
+        private static ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> createMap() {
+            return new ConcurrentSkipListMap<>(comparator);
+        }
+
+        public static StorageState initial(List<MemorySegment> segments) {
+            return new StorageState(
+                    createMap(),
+                    createMap(),
+                    segments
+            );
+        }
+
+        public StorageState compact(MemorySegment compacted) {
+            return new StorageState(readStorage, writeStorage, Collections.singletonList(compacted));
+        }
+
+        public StorageState beforeFlush() {
+            return new StorageState(writeStorage, createMap(), diskSegmentList);
+        }
+
+        public StorageState afterFlush(MemorySegment newPage) {
+            List<MemorySegment> segments = new ArrayList<>(diskSegmentList.size() + 1);
+            segments.addAll(diskSegmentList);
+            segments.add(newPage);
+            return new StorageState(createMap(), writeStorage, segments);
+        }
     }
 }
