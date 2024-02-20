@@ -50,10 +50,6 @@ public class Compaction {
             Path storagePath,
             Iterable<Entry<MemorySegment>> iterable
     ) throws IOException {
-//        if (iterable.iterator(). || (segmentList.size() == 1 && iterable.isEmpty())) {
-//            return;
-//        }
-
         final Path indexTmp = storagePath.resolve(NAME_TMP_INDEX_FILE);
         final Path indexFile = storagePath.resolve(NAME_INDEX_FILE);
 
