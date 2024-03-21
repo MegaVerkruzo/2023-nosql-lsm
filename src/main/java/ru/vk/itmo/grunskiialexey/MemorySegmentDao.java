@@ -1,171 +1,262 @@
 package ru.vk.itmo.grunskiialexey;
 
-import ru.vk.itmo.BaseEntry;
 import ru.vk.itmo.Config;
 import ru.vk.itmo.Dao;
 import ru.vk.itmo.Entry;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
-import java.util.NavigableMap;
+import java.util.List;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
 
 public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>> {
-    private final Comparator<MemorySegment> comparator = (o1, o2) -> {
-        long firstMismatch = o1.mismatch(o2);
-        if (firstMismatch == -1) {
-            return 0;
-        }
-        if (firstMismatch == o1.byteSize()) {
-            return -1;
-        }
-        if (firstMismatch == o2.byteSize()) {
-            return 1;
-        }
+    private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
 
-        byte byte1 = o1.get(ValueLayout.JAVA_BYTE, firstMismatch);
-        byte byte2 = o2.get(ValueLayout.JAVA_BYTE, firstMismatch);
-        return Byte.compare(byte1, byte2);
-    };
-
-    private final NavigableMap<MemorySegment, Entry<MemorySegment>> data = new ConcurrentSkipListMap<>(comparator);
-    private final Path filePath;
+    private static final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
     private final Arena arena;
-    private final MemorySegment page;
+    private final Path path;
+    private final AtomicReference<StorageState> state;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
 
     public MemorySegmentDao(Config config) throws IOException {
-        this.filePath = Paths.get(config.basePath().toString(), "file.db");
+        this.path = config.basePath().resolve("data");
+        Files.createDirectories(path);
+
         arena = Arena.ofShared();
+        List<MemorySegment> segments = DiskStorage.loadOrRecover(path, arena);
+        state = new AtomicReference<>(StorageState.initial(segments));
+    }
 
-        long size;
-        try {
-            size = Files.size(filePath);
-        } catch (NoSuchFileException e) {
-            page = MemorySegment.NULL;
-            return;
+    static int compare(MemorySegment memorySegment1, MemorySegment memorySegment2) {
+        long mismatch = memorySegment1.mismatch(memorySegment2);
+        if (mismatch == -1) {
+            return 0;
         }
 
-        MemorySegment currentPage = null;
-        try (FileChannel channel = FileChannel.open(filePath, StandardOpenOption.READ)) {
-            currentPage = channel.map(FileChannel.MapMode.READ_ONLY, 0, size, arena);
-        } catch (IOException e) {
-            arena.close();
-        } finally {
-            page = currentPage;
+        if (mismatch == memorySegment1.byteSize()) {
+            return -1;
         }
+
+        if (mismatch == memorySegment2.byteSize()) {
+            return 1;
+        }
+        byte b1 = memorySegment1.get(ValueLayout.JAVA_BYTE, mismatch);
+        byte b2 = memorySegment2.get(ValueLayout.JAVA_BYTE, mismatch);
+        return Byte.compare(b1, b2);
     }
 
     @Override
     public Iterator<Entry<MemorySegment>> get(MemorySegment from, MemorySegment to) {
+        StorageState state = this.state.get();
+
+        return Compaction.range(
+                getInMemory(state.readStorage, from, to),
+                getInMemory(state.writeStorage, from, to),
+                state.diskSegmentList,
+                from,
+                to
+        );
+    }
+
+    private Iterator<Entry<MemorySegment>> getInMemory(
+            ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> storage,
+            MemorySegment from, MemorySegment to) {
         if (from == null && to == null) {
-            return data.values().iterator();
-        } else if (from == null) {
-            return data.headMap(to).values().iterator();
-        } else if (to == null) {
-            return data.tailMap(from).values().iterator();
-        } else {
-            return data.subMap(from, to).values().iterator();
+            return storage.values().iterator();
+        }
+        if (from == null) {
+            return storage.headMap(to).values().iterator();
+        }
+        if (to == null) {
+            return storage.tailMap(from).values().iterator();
+        }
+        return storage.subMap(from, to).values().iterator();
+    }
+
+    @Override
+    public void upsert(Entry<MemorySegment> entry) {
+        upsertLock.readLock().lock();
+        try {
+            state.get().writeStorage.put(entry.key(), entry);
+        } finally {
+            upsertLock.readLock().unlock();
         }
     }
 
     @Override
     public Entry<MemorySegment> get(MemorySegment key) {
-        if (data.containsKey(key)) {
-            return data.get(key);
-        }
-        if (page.equals(MemorySegment.NULL)) {
+        synchronized (this) {
+            StorageState state = this.state.get();
+            Entry<MemorySegment> entry = state.writeStorage.get(key);
+            if (entry != null) {
+                if (entry.value() == null) {
+                    return null;
+                }
+                return entry;
+            }
+
+            Iterator<Entry<MemorySegment>> iterator = Compaction.range(
+                    getInMemory(state.readStorage, key, null),
+                    getInMemory(state.writeStorage, key, null),
+                    state.diskSegmentList,
+                    key,
+                    null);
+
+            if (!iterator.hasNext()) {
+                return null;
+            }
+            Entry<MemorySegment> next = iterator.next();
+            if (compare(next.key(), key) == 0) {
+                return next;
+            }
             return null;
         }
-
-        long offset = 0;
-        while (offset < page.byteSize()) {
-            int keyLength = page.get(ValueLayout.JAVA_INT, offset);
-            offset += 4;
-            MemorySegment resultKey = MemorySegment.ofArray(new byte[keyLength]);
-            MemorySegment.copy(page, ValueLayout.JAVA_BYTE, offset, resultKey, ValueLayout.JAVA_BYTE, 0, keyLength);
-            offset += correctAlignedSize(keyLength);
-
-            int valueLength = page.get(ValueLayout.JAVA_INT, offset);
-            offset += 4;
-            MemorySegment resultValue = MemorySegment.ofArray(new byte[valueLength]);
-            MemorySegment.copy(page, ValueLayout.JAVA_BYTE, offset, resultValue, ValueLayout.JAVA_BYTE, 0, valueLength);
-            offset += correctAlignedSize(valueLength);
-
-            if (resultKey.mismatch(key) == -1) {
-                return new BaseEntry<>(
-                        resultKey,
-                        resultValue
-                );
-            }
-        }
-        return null;
     }
 
     @Override
-    public void upsert(Entry<MemorySegment> entry) {
-        if (entry.value() == null) {
-            data.remove(entry.key());
-        } else {
-            data.put(entry.key(), entry);
-        }
+    public void flush() {
+        bgExecutor.execute(() -> {
+            Collection<Entry<MemorySegment>> entries;
+            StorageState prevState = state.get();
+            ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage = prevState.writeStorage;
+            if (writeStorage.isEmpty()) {
+                return;
+            }
+
+            StorageState nextState = prevState.beforeFlush();
+
+            upsertLock.writeLock().lock();
+            try {
+                state.set(nextState);
+            } finally {
+                upsertLock.writeLock().unlock();
+            }
+
+            MemorySegment newPage;
+            entries = writeStorage.values();
+            try {
+                newPage = DiskStorage.save(arena, path, entries);
+            } catch (IOException e) {
+                // termination sequence
+                throw new UncheckedIOException(e);
+            }
+
+            nextState = nextState.afterFlush(newPage);
+            upsertLock.writeLock().lock();
+            try {
+                state.set(nextState);
+            } finally {
+                upsertLock.writeLock().unlock();
+            }
+        });
+    }
+
+    @Override
+    public void compact() {
+        bgExecutor.execute(() -> {
+            synchronized (this) {
+                try {
+                    StorageState state = this.state.get();
+                    MemorySegment newPage = Compaction.compact(arena, path, () -> Compaction.range(
+                            Collections.emptyIterator(),
+                            Collections.emptyIterator(),
+                            state.diskSegmentList,
+                            null,
+                            null
+                    ));
+                    this.state.set(state.compact(newPage));
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        });
     }
 
     @Override
     public void close() throws IOException {
-        if (!arena.scope().isAlive()) {
+        if (closed.getAndSet(true)) {
+            waitForClose();
             return;
         }
 
-        arena.close();
+        flush();
+        bgExecutor.execute(arena::close);
+        bgExecutor.shutdown();
+        waitForClose();
+    }
 
-        try (
-                FileChannel channel = FileChannel.open(
-                        filePath,
-                        StandardOpenOption.CREATE,
-                        StandardOpenOption.READ,
-                        StandardOpenOption.WRITE
-                );
-                Arena writeArena = Arena.ofConfined()
-        ) {
-            long allSize = data.values().stream().mapToLong(entry ->
-                    correctAlignedSize(entry.key().byteSize()) + correctAlignedSize(entry.value().byteSize()) + 2 * 4
-            ).sum();
-            MemorySegment writePage = channel.map(FileChannel.MapMode.READ_WRITE, 0, allSize, writeArena);
-
-            long offset = 0;
-            for (Entry<MemorySegment> entry : data.values()) {
-                long keyLength = entry.key().byteSize();
-                writePage.set(ValueLayout.JAVA_INT, offset, (int) keyLength);
-                offset += 4;
-                MemorySegment.copy(
-                        entry.key(), ValueLayout.JAVA_BYTE, 0,
-                        writePage, ValueLayout.JAVA_BYTE, offset, keyLength
-                );
-                offset += correctAlignedSize(keyLength);
-
-                long valueLength = entry.value().byteSize();
-                writePage.set(ValueLayout.JAVA_INT, offset, (int) valueLength);
-                offset += 4;
-                MemorySegment.copy(
-                        entry.value(), ValueLayout.JAVA_BYTE, 0,
-                        writePage, ValueLayout.JAVA_BYTE, offset, valueLength
-                );
-                offset += correctAlignedSize(valueLength);
+    private void waitForClose() throws InterruptedIOException {
+        try {
+            if (!bgExecutor.awaitTermination(11, TimeUnit.MINUTES)) {
+                throw new InterruptedException("Timeout");
             }
+        } catch (InterruptedException e) {
+            InterruptedIOException exception = new InterruptedIOException("Interrupted or timed out");
+            exception.initCause(e);
+            throw exception;
         }
     }
 
-    private long correctAlignedSize(long offset) {
-        return offset % 4 == 0 ? offset : offset + 4 - (offset % 4);
+    private static class StorageState {
+        private final ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> readStorage;
+        private final ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage;
+        private final List<MemorySegment> diskSegmentList;
+
+        private StorageState(
+                ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> readStorage,
+                ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> writeStorage,
+                List<MemorySegment> diskSegmentList
+        ) {
+            this.readStorage = readStorage;
+            this.writeStorage = writeStorage;
+            this.diskSegmentList = diskSegmentList;
+        }
+
+        private static ConcurrentSkipListMap<MemorySegment, Entry<MemorySegment>> createMap() {
+            return new ConcurrentSkipListMap<>(comparator);
+        }
+
+        public static StorageState initial(List<MemorySegment> segments) {
+            return new StorageState(
+                    createMap(),
+                    createMap(),
+                    segments
+            );
+        }
+
+        public StorageState compact(MemorySegment compacted) {
+            return new StorageState(readStorage, writeStorage, Collections.singletonList(compacted));
+        }
+
+        public StorageState beforeFlush() {
+            return new StorageState(writeStorage, createMap(), diskSegmentList);
+        }
+
+        public StorageState afterFlush(MemorySegment newPage) {
+            List<MemorySegment> segments = new ArrayList<>(diskSegmentList.size() + 1);
+            segments.addAll(diskSegmentList);
+            segments.add(newPage);
+            return new StorageState(createMap(), writeStorage, segments);
+        }
     }
 }
